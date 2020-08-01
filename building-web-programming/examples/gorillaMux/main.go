@@ -1,11 +1,13 @@
 package main
 
 import (
+	"crypto/tls"
 	"database/sql"
 	"fmt"
+	"html/template"
 	"log"
 	"net/http"
-	"os"
+	"time"
 
 	_ "github.com/go-sql-driver/mysql"
 	"github.com/gorilla/mux"
@@ -17,7 +19,7 @@ const (
 	// DBHost .
 	DBHost = "localhost"
 	// DBPort .
-	DBPort = "3307"
+	DBPort = "3306"
 	// DBUser .
 	DBUser = "root"
 	// DBPass .
@@ -28,76 +30,149 @@ const (
 
 // Page represents a db row of pages table
 type Page struct {
-	Title   string
-	Content string
-	Date    string
+	Title      string
+	RawContent string
+	Content    template.HTML
+	Date       string
+	GUID       string
+}
+
+//TruncatedText to show ... if text big
+func (p Page) TruncatedText() template.HTML {
+	chars := 0
+	for i := range p.Content {
+		chars++
+		if chars > 150 {
+			return p.Content[:i] + "..."
+		}
+	}
+	return p.Content
 }
 
 var database *sql.DB
 
 func main() {
-	connDB()
+	ConnDB()
 
-	router := mux.NewRouter()
-	router.HandleFunc("/page/{id:[0-9]+}", staticPageHandler)
-	router.HandleFunc("/page/{guid:[0-9a-zA\\-]+}", dynamicPageHandler)
-	router.HandleFunc("/notfound", error404PageHandler)
-	http.Handle("/", router)
-	http.ListenAndServe(PORT, nil)
-}
-
-func staticPageHandler(w http.ResponseWriter, r *http.Request) {
-	vars := mux.Vars(r)
-	pageID := vars["id"]
-	fileName := "files/" + pageID + ".html"
-	fmt.Println(pageID)
-	_, err := os.Stat(fileName)
-
+	certificates, err := tls.LoadX509KeyPair("c:/cert/server.crt", "c:/cert/server.key")
+	tlsConf := tls.Config{Certificates: []tls.Certificate{certificates}}
+	tls.Listen("tcp", ":8080", &tlsConf)
 	if err != nil {
-		http.Redirect(w, r, "/notfound", http.StatusMovedPermanently)
-		return
+		log.Println(err.Error())
 	}
 
-	http.ServeFile(w, r, fileName)
+	routes := mux.NewRouter()
+
+	routes.HandleFunc("/api/pages", APIPage).
+		Methods("GET").
+		Schemes("https")
+	routes.HandleFunc("/api/page/{guid:[0-9a-zA\\-]+}", APIPage).
+		Methods("GET").
+		Schemes("https")
+
+	routes.HandleFunc("/page/{guid:[0-9a-zA\\-]+}", ServePage)
+	routes.HandleFunc("/", RedirIndex)
+	routes.HandleFunc("/home", ServeIndex)
+	http.Handle("/", routes)
+
+	log.Println("Server ON -> " + time.Now().String())
+	log.Fatal(http.ListenAndServe(PORT, nil))
 }
 
-func dynamicPageHandler(w http.ResponseWriter, r *http.Request) {
+// ServePage .
+func ServePage(w http.ResponseWriter, r *http.Request) {
 	vars := mux.Vars(r)
 	pageGUID := vars["guid"]
 	thisPage := Page{}
-	fmt.Println(pageGUID)
 	err := database.
 		QueryRow("SELECT page_title, page_content, page_date FROM pages WHERE page_guid = ?", pageGUID).
-		Scan(&thisPage.Title, &thisPage.Content, &thisPage.Date)
+		Scan(&thisPage.Title, &thisPage.RawContent, &thisPage.Date)
+	thisPage.Content = template.HTML(thisPage.RawContent)
 
 	if err != nil {
 		http.Error(w, http.StatusText(404), http.StatusNotFound)
 		log.Println("Can't get page. GUID:" + pageGUID + " " + err.Error())
+		return
 	}
-	html := getPage(thisPage)
-	fmt.Fprintln(w, html)
+	t, err := template.ParseFiles("templates/blog.html")
+	if err != nil {
+		log.Println("Erro ao carregar template", err.Error())
+	}
+	t.Execute(w, thisPage)
 }
 
-func error404PageHandler(w http.ResponseWriter, r *http.Request) {
-	fmt.Println("Error")
-	fileName := "files/404.html"
-	http.ServeFile(w, r, fileName)
+// RedirIndex .
+func RedirIndex(w http.ResponseWriter, r *http.Request) {
+	http.Redirect(w, r, "/home", http.StatusPermanentRedirect)
 }
 
-func getPage(thisPage Page) string {
-	return `<html><head><title>` + thisPage.Title +
-		`</title></head><body><h1>` + thisPage.Title + `</h1><div>` +
-		thisPage.Content + `</div></body></html>`
+// ServeIndex .
+func ServeIndex(w http.ResponseWriter, r *http.Request) {
+	var Pages = []Page{}
+	pages, err := database.Query("SELECT page_title, page_content, page_date, page_guid FROM pages ORDER BY ? DESC", "page_date")
+
+	if err != nil {
+		fmt.Fprintln(w, err.Error())
+	}
+
+	defer pages.Close()
+	for pages.Next() {
+		thisPage := Page{}
+		err := pages.Scan(&thisPage.Title, &thisPage.RawContent, &thisPage.Date, &thisPage.GUID)
+		thisPage.Content = template.HTML(thisPage.RawContent)
+
+		if err != nil {
+			log.Fatal("Erro: " + err.Error())
+		}
+
+		Pages = append(Pages, thisPage)
+	}
+
+	t, err := template.ParseFiles("templates/index.html")
+
+	if err != nil {
+		log.Fatal("Erro: " + err.Error())
+	}
+
+	t.Execute(w, Pages)
 }
 
-func connDB() {
+// APIPage .
+func APIPage(w http.ResponseWriter, r *http.Request) {
+	vars := mux.Vars(r)
+	pageGUID := vars["guid"]
+	thisPage := Page{}
+	err := database.
+		QueryRow("SELECT page_title, page_content, page_date FROM pages WHERE page_guid = ?", pageGUID).
+		Scan(&thisPage.Title, &thisPage.RawContent, &thisPage.Date)
+	thisPage.Content = template.HTML(thisPage.RawContent)
+
+	if err != nil {
+		http.Error(w, http.StatusText(404), http.StatusNotFound)
+		log.Println(err.Error())
+		return
+	}
+
+	// APIOutput, err := json.Marshal(thisPage)
+	// fmt.Println(APIOutput)
+
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	fmt.Fprintln(w, thisPage)
+
+}
+
+//ConnDB .
+func ConnDB() {
 	dbConn := fmt.Sprintf("%s:%s@tcp(%s:%s)/%s", DBUser, DBPass, DBHost, DBPort, DBDBase)
-	fmt.Println("connection string: " + dbConn)
 	db, err := sql.Open("mysql", dbConn)
 
 	if err != nil {
-		log.Println("Could'n connect")
-		log.Println(err.Error())
+		log.Println("Could'n connect", err.Error())
 	}
 
 	database = db
